@@ -1,2 +1,4 @@
 /target
 .vscode/
+/web/dist/
+node_modules/

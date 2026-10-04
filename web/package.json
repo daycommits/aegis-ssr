@@ -1,0 +1,14 @@
+{
+  "name": "aegis-web",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "esbuild src/entry.jsx --bundle --format=iife --platform=neutral --define:process.env.NODE_ENV='\"production\"' --outfile=dist/bundle.js"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
