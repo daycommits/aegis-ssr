@@ -28,18 +28,18 @@ A context represents the global JavaScript environment (e.g. globalThis, built-i
 
 ### Step 4 Compile and execute
 1. Create js code string
-```
-let js_code = r#"
-    const engine = "Aegis";
-    const version = 1;
-    const features = ["Memory Isolation", "Watchdogs", "Sub-millisecond Renders"];
+    ```
+    let js_code = r#"
+        const engine = "Aegis";
+        const version = 1;
+        const features = ["Memory Isolation", "Watchdogs", "Sub-millisecond Renders"];
 
-    // Compute a summary using arrow functions and array methods
-    const summary = features.map((f, i) => `${i + 1}. ${f}`).join(" | ");
+        // Compute a summary using arrow functions and array methods
+        const summary = features.map((f, i) => `${i + 1}. ${f}`).join(" | ");
 
-    `🛡️ [${engine} v${version}] Active features: ${summary} (Calculation: 10 * 42 = ${10 * 42})`
-"#;
-```
+        `🛡️ [${engine} v${version}] Active features: ${summary} (Calculation: 10 * 42 = ${10 * 42})`
+    "#;
+    ```
 2. Create a v8 javascript string. `let code = v8::String::new(scope, js_code).unwrap();`
     - `v8::String::new(...)` returns option - Some(value) or None
     - `.unwrap()` returns value from Some(value) or crash when None
@@ -49,6 +49,52 @@ let js_code = r#"
     `let result = script.run(scope).expect("Failed to execute script");`
 5. Convert the V8 string value back into a Rust String
     `let result_str = result.to_rust_string_lossy(scope);`
+
+## Host Shims & JS Globals
+### Step 2 Console log proxy
+1. Create Shim poxy
+    ```
+    fn console_log_callback(
+        scope: &mut v8::PinScope,   // The pinned scope active during this function call
+        args: v8::FunctionCallbackArguments,    // The array of arguments JavaScript passed in
+        _rv: v8::ReturnValue<v8::Value>,    // Return slot (console.log returns undefined, so unused)
+    ) {
+        let mut parts = Vec::new();
+
+        // Iterate through all arguments passed by JS (e.g. console.log("User:", 42, true))
+        for i in 0..args.length() {
+            let arg = args.get(i);
+
+            // Convert the V8 JavaScript value (string, number, object, etc.) into a Rust String
+            parts.push(arg.to_rust_string_lossy(scope));
+        }
+
+        // Print the captured JS arguments through Rust's standard output
+        println!("🦀 [Rust console.log proxy] {}", parts.join(" "));
+    }
+    ```
+### Step 2 Attach to global this
+1. Access JavaScript's root global scope (equivalent to `globalThis`)
+    `let global = context.global(scope);`
+2. Create a brand new, empty JavaScript object in V8's heap -> `{}`
+    `let console_obj = v8::Object::new(scope);`
+3. Wrap our native Rust callback into a callable JavaScript function
+    `let log_fn = v8::Function::new(scope, console_log_callback).unwrap();`
+4. Attach `log_fn` method onto the `log` key of console_obj
+    ```
+    let log_key = v8::String::new(scope, "log").unwrap();
+    console_obj.set(scope, log_key.into(), log_fn.into());
+    ```
+    - Create a js string `log`
+    - Set `log` as key and value as `log_fn`
+5. Repeat the step 4 and attach `console` key and value `console_obj` in global
+    ```
+    let console_key = v8::String::new(scope, "console").unwrap();
+    global.set(scope, console_key.into(), console_obj.into());
+    ```
+
+
+
 
 ## Miscellaneous
 - `to_rust_string_lossy` is a method on `v8::Local<v8::String>` in the Rust v8 crate. It converts an internal V8 JavaScript string into a standard Rust String.
