@@ -1,53 +1,57 @@
 # Aegis-SSR — Learning Milestones Index
 
-Welcome to **Aegis-SSR** (🛡️), an educational, from-scratch implementation of a multi-tenant Server-Side Rendering (SSR) platform using Rust and Google's V8 JavaScript engine (V8 152+).
+Welcome to **Aegis-SSR** (🛡️). This curriculum is designed to teach you **`ssr-platform`** by building it module-for-module from scratch. 
 
-This folder contains the complete step-by-step curriculum for building the engine from zero.
-
----
-
-## 🗺️ Milestone Roadmap
-
-| Milestone | Title | Status | Core Concept Learned |
-| :---: | :--- | :---: | :--- |
-| [**01**](./01-hello-v8.md) | **Hello V8** | ✅ Completed | V8 Platform initialization, `Isolate`, `PinnedRef`, `v8::scope!`, `ContextScope` |
-| [**02**](./02-host-shims.md) | **Host Shims & JS Globals** | 🟡 Next Up | Exposing Rust callbacks (`FunctionCallbackArguments`), injecting `console.log` into `globalThis` |
-| [**03**](./03-first-react-ssr.md) | **First React SSR** | ⏳ Planned | Bundling React 19 with `esbuild`, loading bundles into V8, executing `renderToString` |
-| [**04**](./04-guardrails-and-limits.md) | **Guardrails & Limits** | ⏳ Planned | Wall-clock Watchdog threads, V8 near-heap-limit callbacks, crash isolation via `catch_unwind` |
-| [**05**](./05-isolate-pooling.md) | **Isolate Worker Pooling** | ⏳ Planned | Dedicated OS threads, crossbeam MPMC job queues, warm isolate reuse, isolate retirement |
-| [**06**](./06-http-gateway.md) | **Axum HTTP Gateway** | ⏳ Planned | Asynchronous HTTP endpoints (`GET /render/:tenant`), request tracing headers, queue admission |
-| [**07**](./07-multi-tenancy.md) | **Multi-Tenancy & Manifest** | ⏳ Planned | Dynamic tenant registry (`tenants.json`), per-tenant resource ceilings, bundle hot-reloading |
-| [**08**](./08-elastic-scaling-and-canaries.md) | **Elastic Scaling & Canaries** | ⏳ Planned | Scale-to-zero cold pools (`pool_size: 0`), queue-driven elasticity, sticky cookie canary routing |
+From **Milestone 1**, code is organized into the exact same files and folders used in `ssr-platform`.
 
 ---
 
-## 🏗️ Architectural Progression
+## 🗺️ Milestone Roadmap & Module Mapping
 
-Each milestone adds a distinct system layer:
+| Milestone | Title | Exact Files Introduced | Role in `ssr-platform` |
+| :---: | :--- | :--- | :--- |
+| [**01**](./01-hello-v8.md) | **Hello V8 & Isolate Harness** | `src/lib.rs`<br>`src/isolate_runner.rs`<br>`src/main.rs` | V8 platform init & isolate execution harness |
+| [**02**](./02-host-shims.md) | **Host Shims & Native Console** | `src/shims.rs`<br>`src/isolate_runner.rs` (`bind_console`) | Polyfills prelude & native FFI console proxy |
+| [**03**](./03-first-react-ssr.md) | **React SSR & Bundle Loader** | `web-bundle/`<br>`src/bundle.rs` | React 19 esbuild bundle & script assembly |
+| [**04**](./04-guardrails-and-limits.md) | **Guardrails & Limits** | `src/isolate_runner.rs` (`TenantSpec`) | Watchdog timeouts & heap memory guards |
+| [**05**](./05-isolate-pooling.md) | **Isolate Worker Pooling** | `src/isolate_pool.rs` | Multi-threaded MPMC worker pool |
+| [**06**](./06-http-gateway.md) | **Axum HTTP Gateway** | `src/bin/gateway.rs` | Production Axum server (`/health`, `/render`) |
+| [**07**](./07-multi-tenancy.md) | **Multi-Tenancy & Manifest** | `tenants.json`<br>`src/tenant_registry.rs`<br>`src/deployment.rs` | Tenant manifest & multi-pool orchestrator |
+| [**08**](./08-elastic-scaling-and-canaries.md) | **Elastic Scaling & Canaries** | `src/cohort.rs` | Sticky canary cookies & scale-to-zero |
 
-```
-[Milestone 1: V8 Core]
-        │
-[Milestone 2: Host Shims] (console, fetch shims)
-        │
-[Milestone 3: React SSR] (esbuild + ReactDOMServer)
-        │
-[Milestone 4: Guardrails] (Heap limit + Watchdog thread)
-        │
-[Milestone 5: Worker Pool] (OS Threads + Crossbeam MPMC)
-        │
-[Milestone 6: HTTP Gateway] (Axum + Tokio)
-        │
-[Milestone 7: Multi-Tenancy] (tenants.json + dynamic loading)
-        │
-[Milestone 8: Production Polish] (Scale-to-zero + Canaries)
+---
+
+## 📁 The Target File Tree (Matching `ssr-platform`)
+
+```text
+aegis-ssr/
+├── tenants.json                  <-- Declarative tenant manifest
+├── docs/
+│   └── milestones/               <-- Curriculum & guides
+├── web-bundle/                   <-- React applications
+│   ├── package.json
+│   ├── src/entry.jsx
+│   └── dist/bundle.js            <-- Compiled JS bundle
+├── src/
+│   ├── lib.rs                    <-- Library root (exports all modules)
+│   ├── shims.rs                  <-- Web API polyfills (MessageChannel, TextEncoder)
+│   ├── bundle.rs                 <-- Script assembler (combines shims + bundle + entry)
+│   ├── isolate_runner.rs         <-- V8 execution harness, native console, watchdog
+│   ├── isolate_pool.rs           <-- Multi-threaded MPMC isolate worker pool
+│   ├── tenant_registry.rs        <-- Manifest loader (tenants.json)
+│   ├── deployment.rs             <-- DeploymentManager managing active & canary pools
+│   ├── cohort.rs                 <-- Sticky cookie canary routing (v8i_cohort)
+│   ├── main.rs                   <-- Standalone CLI test harness (`cargo run`)
+│   └── bin/
+│       └── gateway.rs            <-- Production HTTP server (`cargo run --bin gateway`)
+├── Cargo.lock
+└── Cargo.toml
 ```
 
 ---
 
 ## 📌 How to Follow This Guide
-1. Follow each milestone in order.
-2. Read the explanation of **why** the feature is needed.
-3. Review the code changes.
-4. Copy the code into your `src/` files and run `cargo run` or `cargo test`.
-5. Check off the milestone verification checklist before moving to the next.
+1. Follow each milestone sequentially.
+2. Read the explanation of **why** the module exists in `ssr-platform`.
+3. Add the files to your repository.
+4. Run `cargo run` (or `cargo run --bin gateway`) to verify.

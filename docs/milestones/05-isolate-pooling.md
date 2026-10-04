@@ -1,7 +1,24 @@
-# Milestone 05: Isolate Worker Pooling
+# Milestone 05: Isolate Worker Pooling (`src/isolate_pool.rs`)
 
 ## 🎯 Goal
-Build a multi-threaded worker pool where dedicated OS threads hold pre-warmed V8 isolates with compiled React bundles, processing incoming render jobs via concurrent MPMC channels without isolate recreation overhead.
+Build a dedicated worker pool module in **`src/isolate_pool.rs`** (matching `ssr-platform`), where OS worker threads maintain warm V8 isolates with compiled JavaScript bundles, processing jobs concurrently over MPMC `crossbeam-channel` queues.
+
+---
+
+## 📁 File Structure Introduced
+```text
+aegis-ssr/
+├── src/
+│   ├── lib.rs              <-- Library root (exports isolate_pool)
+│   ├── shims.rs            <-- Browser polyfills
+│   ├── isolate_runner.rs   <-- Execution engine & guardrails
+│   ├── isolate_pool.rs     <-- 🌟 NEW: Multi-threaded isolate pool
+│   └── main.rs             <-- Test harness submitting concurrent jobs
+├── web-bundle/
+│   └── dist/bundle.js
+├── Cargo.lock
+└── Cargo.toml
+```
 
 ---
 
@@ -19,33 +36,57 @@ We use `crossbeam-channel` so multiple requests can be queued, and whichever wor
 
 ```
 Request 1 ──┐
-Request 2 ──┼──> [crossbeam channel] ──> Worker Thread 1 (Warm Isolate)
-Request 3 ──┘                       ──> Worker Thread 2 (Warm Isolate)
+Request 2 ──┼──> [crossbeam MPMC channel] ──> Worker Thread 1 (Warm Isolate)
+Request 3 ──┘                             ──> Worker Thread 2 (Warm Isolate)
 ```
 
 ---
 
 ## 📝 Implementation
 
-### Dependencies (`Cargo.toml`)
+### 1. Update `Cargo.toml`
+Add `crossbeam-channel`:
+
 ```toml
+[package]
+name = "aegis-ssr"
+version = "0.1.0"
+edition = "2024"
+
 [dependencies]
 v8 = "152.2.0"
 crossbeam-channel = "0.5"
 ```
 
-### Code (`src/main.rs`)
+---
+
+### 2. Update `src/lib.rs`
+Export the new module:
+
+```rust
+pub mod bundle;
+pub mod isolate_pool;
+pub mod isolate_runner;
+pub mod shims;
+```
+
+---
+
+### 3. Create `src/isolate_pool.rs`
+Create `src/isolate_pool.rs` matching `ssr-platform/src/isolate_pool.rs`:
+
 ```rust
 use std::sync::mpsc::{channel as oneshot_channel, Sender as OneshotSender};
-use crossbeam_channel::{unbounded, Sender, Receiver};
 use std::thread;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use crate::shims::HOST_API_SHIM_PRELUDE;
 
-struct RenderJob {
-    props: String,
-    reply_tx: OneshotSender<Result<String, String>>,
+pub struct RenderJob {
+    pub props: String,
+    pub reply_tx: OneshotSender<Result<String, String>>,
 }
 
-struct IsolatePool {
+pub struct IsolatePool {
     job_tx: Sender<RenderJob>,
 }
 
@@ -65,27 +106,29 @@ impl IsolatePool {
 
     pub fn render(&self, props: String) -> Result<String, String> {
         let (reply_tx, reply_rx) = oneshot_channel();
-        self.job_tx.send(RenderJob { props, reply_tx }).unwrap();
-        reply_rx.recv().unwrap()
+        self.job_tx.send(RenderJob { props, reply_tx }).map_err(|e| e.to_string())?;
+        reply_rx.recv().map_err(|e| e.to_string())?
     }
 }
 
 fn worker_loop(id: usize, job_rx: Receiver<RenderJob>, bundle_code: &str) {
-    // 1. Each worker owns one warm Isolate
+    // 1. Initialize warm isolate for this thread
     let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
     v8::scope!(let scope, isolate);
 
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
-    // 2. Pre-compile the bundle ONCE at startup
+    // 2. Pre-evaluate shims and bundle ONCE at worker startup
+    let shim_code = v8::String::new(scope, HOST_API_SHIM_PRELUDE).unwrap();
+    v8::Script::compile(scope, shim_code, None).unwrap().run(scope).unwrap();
+
     let code = v8::String::new(scope, bundle_code).unwrap();
-    let script = v8::Script::compile(scope, code, None).unwrap();
-    script.run(scope).unwrap();
+    v8::Script::compile(scope, code, None).unwrap().run(scope).unwrap();
 
     println!("👷 Worker #{} ready and warm!", id);
 
-    // 3. Process jobs in a loop
+    // 3. Keep serving requests from the crossbeam channel
     while let Ok(job) = job_rx.recv() {
         let global = context.global(scope);
         let render_key = v8::String::new(scope, "render").unwrap();
@@ -103,43 +146,47 @@ fn worker_loop(id: usize, job_rx: Receiver<RenderJob>, bundle_code: &str) {
         let _ = job.reply_tx.send(result);
     }
 }
+```
+
+---
+
+### 4. Update `src/main.rs`
+Demonstrate concurrent rendering using the pool:
+
+```rust
+use aegis_ssr::{isolate_pool::IsolatePool, isolate_runner::init_v8_once};
+use std::fs;
+use std::thread;
 
 fn main() {
-    let platform = v8::new_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
+    init_v8_once();
 
-    // Mock bundle exposing globalThis.render
-    let bundle = r#"
-        globalThis.render = (propsJson) => {
-            const props = JSON.parse(propsJson);
-            return `<div><h1>Hello ${props.user}</h1><p>Items in cart: ${props.cart}</p></div>`;
-        };
-    "#;
+    let bundle_source = fs::read_to_string("web-bundle/dist/bundle.js")
+        .expect("Please build bundle first: (cd web-bundle && npm run build)");
 
-    println!("🚀 Spawning isolate pool of 4 workers...");
-    let pool = IsolatePool::new(4, bundle);
+    // Leak to static lifetime so worker threads can read it
+    let bundle_static: &'static str = Box::leak(bundle_source.into_boxed_str());
 
-    // Give workers a moment to initialize
+    println!("🚀 Initializing IsolatePool (4 warm workers)...");
+    let pool = IsolatePool::new(4, bundle_static);
+
     thread::sleep(std::time::Duration::from_millis(50));
 
-    println!("\n⚡ Submitting concurrent render jobs:");
-    let handles: Vec<_> = (1..=8).map(|i| {
-        let pool_ref = pool.job_tx.clone();
+    println!("\n⚡ Submitting concurrent render jobs across worker pool:");
+    let handles: Vec<_> = (1..=6).map(|i| {
+        let pool_ref = &pool;
         thread::spawn(move || {
-            let (tx, rx) = oneshot_channel();
-            pool_ref.send(RenderJob {
-                props: format!(r#"{{"user": "Customer_{}", "cart": {}}}"#, i, i * 2),
-                reply_tx: tx,
-            }).unwrap();
-            let html = rx.recv().unwrap().unwrap();
-            println!("  [Job #{}] -> {}", i, html);
+            let props = format!(r#"{{"title": "Store #{}", "user": "Customer_{}"}}"#, i, i);
+            let html = pool_ref.render(props).unwrap();
+            println!("  [Job #{}] -> Rendered HTML length: {} bytes", i, html.len());
         })
     }).collect();
 
     for h in handles {
         h.join().unwrap();
     }
+
+    println!("\n✅ All concurrent render jobs completed successfully!");
 }
 ```
 
@@ -153,23 +200,22 @@ cargo run
 
 Expected output:
 ```text
-🚀 Spawning isolate pool of 4 workers...
+🚀 Initializing IsolatePool (4 warm workers)...
 👷 Worker #0 ready and warm!
 👷 Worker #1 ready and warm!
 👷 Worker #2 ready and warm!
 👷 Worker #3 ready and warm!
 
-⚡ Submitting concurrent render jobs:
-  [Job #1] -> <div><h1>Hello Customer_1</h1><p>Items in cart: 2</p></div>
-  [Job #2] -> <div><h1>Hello Customer_2</h1><p>Items in cart: 4</p></div>
+⚡ Submitting concurrent render jobs across worker pool:
+  [Job #1] -> Rendered HTML length: 228 bytes
+  [Job #2] -> Rendered HTML length: 228 bytes
   ...
+✅ All concurrent render jobs completed successfully!
 ```
-
-Notice: Requests are served in parallel across workers with near-zero latency!
 
 ---
 
 ## ✅ Checklist
-- [ ] Understand why thread-per-isolate is the right model for V8.
-- [ ] Master the MPMC job queue pattern with crossbeam channels.
-- [ ] Verify that pre-warmed isolates reuse their compiled state across requests.
+- [ ] Created `src/isolate_pool.rs` matching `ssr-platform`.
+- [ ] Preserved warm isolates on dedicated OS threads.
+- [ ] Dispatched concurrent jobs across threads via `crossbeam-channel`.

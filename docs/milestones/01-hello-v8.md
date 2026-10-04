@@ -1,27 +1,43 @@
-# Milestone 01: Hello V8
+# Milestone 01: Hello V8 & Isolate Harness
 
 ## 🎯 Goal
-Initialize the Google V8 engine platform inside Rust, create an independent Isolate, evaluate real JavaScript computation (variables, arrays, arrow functions, and template literals), and read the computed result back into Rust.
+Set up the foundational architecture matching `ssr-platform`:
+1. **`src/lib.rs`**: Only module declarations (`pub mod isolate_runner;`).
+2. **`src/isolate_runner.rs`**: All V8 logic — platform initialization (`init_v8_once`), isolate creation, and script execution (`run_script`).
+3. **`src/main.rs`**: The CLI runner that invokes `isolate_runner` and prints the output.
+
+---
+
+## 📁 File Structure (`ssr-platform` layout)
+```text
+aegis-ssr/
+├── src/
+│   ├── lib.rs              <-- 🌟 Only module exports (pub mod ...)
+│   ├── isolate_runner.rs   <-- 🌟 All V8 code: init_v8_once & run_script
+│   └── main.rs             <-- 🌟 CLI test runner
+├── Cargo.lock
+└── Cargo.toml
+```
 
 ---
 
 ## 💡 Concepts
 
-### 1. V8 Platform vs. Isolate
-- **Platform (`v8::V8::initialize_platform`)**: The global runtime engine. Handles background thread pools, CPU feature discovery, and platform timers. Initialized **once** per process.
-- **Isolate (`v8::Isolate`)**: An entirely self-contained instance of V8. It has its own private heap memory, call stack, and garbage collector. Different isolates can run in parallel on different OS threads without lock contention.
+### 1. `src/lib.rs` is Only Module Declarations
+In `ssr-platform`, **`src/lib.rs` contains zero logic**—it only exports modules:
+```rust
+pub mod isolate_runner;
+```
+This keeps the root clean and decouples module discovery from implementation details.
 
-### 2. Pinned Scopes (`v8::scope!`)
-In modern V8 (v140+ / v152+), scopes cannot simply be moved or aliased across the stack because the V8 garbage collector tracks handle addresses. V8 uses Rust's `Pin` mechanism via the `v8::scope!(let scope, isolate);` macro to guarantee memory safety.
-
-### 3. Context (`v8::Context`)
-A context represents the global JavaScript environment (e.g. `globalThis`, built-in constructors like `Object`, `Array`, `Promise`). An isolate can have multiple contexts, but each script executes within a specific context.
+### 2. All V8 Logic Lives in `src/isolate_runner.rs`
+In `ssr-platform`, V8 platform initialization (`init_v8_once`) and isolate management live together inside **`src/isolate_runner.rs`**.
 
 ---
 
 ## 📝 Implementation
 
-### Dependencies (`Cargo.toml`)
+### 1. Dependencies (`Cargo.toml`)
 ```toml
 [package]
 name = "aegis-ssr"
@@ -32,51 +48,92 @@ edition = "2024"
 v8 = "152.2.0"
 ```
 
-### Code (`src/main.rs`)
+---
+
+### 2. Create `src/lib.rs`
+`src/lib.rs` only declares public modules:
+
 ```rust
-fn main() {
-    // 1. Initialize the global V8 platform once per process
-    let platform = v8::new_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
+pub mod isolate_runner;
+```
 
-    println!("✅ V8 platform initialized.");
+---
 
-    // 2. Create a new Isolate
+### 3. Create `src/isolate_runner.rs`
+All V8 engine initialization and execution code lives here:
+
+```rust
+use std::sync::Once;
+
+static V8_INIT: Once = Once::new();
+
+/// Global one-time V8 platform initialization (matching ssr-platform)
+pub fn init_v8_once() {
+    V8_INIT.call_once(|| {
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+    });
+}
+
+/// The V8 execution harness
+pub fn run_script(js_code: &str) -> Result<String, String> {
+    // 1. Create a fresh Isolate
     let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
 
-    // 3. Create a pinned HandleScope using the modern v8::scope! macro
+    // 2. Pin the handle scope using the modern v8::scope! macro
     v8::scope!(let scope, isolate);
 
-    // 4. Create a Context (global execution environment)
+    // 3. Create execution context
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
-    // 5. Write real JavaScript code with computation, arrays, and template strings
+    // 4. Allocate JS string in V8's heap
+    let code = match v8::String::new(scope, js_code) {
+        Some(c) => c,
+        None => return Err("Failed to allocate JS string: heap exhausted".to_string()),
+    };
+
+    // 5. Compile and run
+    let script = match v8::Script::compile(scope, code, None) {
+        Some(s) => s,
+        None => return Err("Failed to compile JavaScript".to_string()),
+    };
+
+    match script.run(scope) {
+        Some(result) => Ok(result.to_rust_string_lossy(scope)),
+        None => Err("Script execution failed or terminated".to_string()),
+    }
+}
+```
+
+---
+
+### 4. Create `src/main.rs`
+```rust
+use aegis_ssr::isolate_runner::{init_v8_once, run_script};
+
+fn main() {
+    // 1. Initialize V8 platform via isolate_runner
+    init_v8_once();
+    println!("✅ V8 platform initialized.");
+
+    // 2. Real JavaScript computation
     let js_code = r#"
         const engine = "Aegis";
         const version = 1;
         const features = ["Memory Isolation", "Watchdogs", "Sub-millisecond Renders"];
 
-        // Compute a summary using arrow functions and array methods
         const summary = features.map((f, i) => `${i + 1}. ${f}`).join(" | ");
 
         `🛡️ [${engine} v${version}] Active features: ${summary} (Calculation: 10 * 42 = ${10 * 42})`
     "#;
 
-    let code = v8::String::new(scope, js_code).unwrap();
-
-    // 6. Compile the script
-    let script = v8::Script::compile(scope, code, None)
-        .expect("Failed to compile JavaScript");
-
-    // 7. Execute the script and get the evaluated result
-    let result = script.run(scope).expect("Failed to execute script");
-
-    // 8. Convert the V8 string value back into a Rust String
-    let result_str = result.to_rust_string_lossy(scope);
-
-    println!("🎉 JavaScript returned:\n{}", result_str);
+    // 3. Run through isolate_runner harness
+    match run_script(js_code) {
+        Ok(output) => println!("🎉 JavaScript returned:\n{}", output),
+        Err(err) => eprintln!("❌ Error: {}", err),
+    }
 }
 ```
 
@@ -98,7 +155,6 @@ Expected output:
 ---
 
 ## ✅ Checklist
-- [x] V8 platform initializes without panic.
-- [x] Isolate creates its own private heap.
-- [x] `v8::scope!` safely pins the scope to the stack.
-- [x] Real JavaScript computation (mapping, array manipulation, template strings, math) executes and returns to Rust.
+- [ ] `src/lib.rs` contains only module declarations (`pub mod isolate_runner;`).
+- [ ] `src/isolate_runner.rs` contains `init_v8_once()` and `run_script()`.
+- [ ] Executed JavaScript from `src/main.rs` via `isolate_runner`.

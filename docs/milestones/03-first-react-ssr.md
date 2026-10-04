@@ -1,50 +1,62 @@
-# Milestone 03: First React SSR
+# Milestone 03: React SSR & Bundle Loader (`web-bundle/` & `src/bundle.rs`)
 
 ## 🎯 Goal
-Bundle a real React 19 component using `esbuild`, provide browser API shims via a dedicated `src/shims.rs` module (matching `ssr-platform`), load the bundle into V8 from Rust, pass JSON props, and capture server-rendered HTML via `ReactDOMServer.renderToString()`.
+Implement the React SSR bundling and loading pipeline matching `ssr-platform`:
+1. **`web-bundle/`**: Set up React 19 and compile a production bundle using `esbuild`.
+2. **`src/shims.rs`**: Add `TextEncoder`, `TextDecoder`, and `MessageChannel` polyfills.
+3. **`src/bundle.rs`**: Build the script assembler module (matching `ssr-platform/src/bundle.rs`) that reads the compiled bundle and wraps it with shims.
+4. **`src/isolate_runner.rs` & `src/main.rs`**: Execute `ReactDOMServer.renderToString()` inside V8 and print server-rendered HTML.
+
+---
+
+## 📁 File Structure (`ssr-platform` layout)
+```text
+aegis-ssr/
+├── web-bundle/             <-- 🌟 Matches ssr-platform/web-bundle/
+│   ├── package.json
+│   ├── src/entry.jsx
+│   └── dist/bundle.js      <-- Built JS bundle
+├── src/
+│   ├── lib.rs              <-- Exports shims, bundle, isolate_runner
+│   ├── shims.rs            <-- Updated with TextEncoder & MessageChannel
+│   ├── bundle.rs           <-- 🌟 NEW: Script assembler matching ssr-platform
+│   ├── isolate_runner.rs   <-- Executes render(props)
+│   └── main.rs             <-- CLI test runner
+├── Cargo.lock
+└── Cargo.toml
+```
 
 ---
 
 ## 💡 Concepts
 
-### 1. Bundling for a Bare V8 Environment
-In a bare V8 isolate, there are no Node.js built-ins. Therefore:
-1. We import from **`react-dom/server.browser`** (the standalone build).
-2. We compile using `esbuild` with `--platform=neutral`.
-3. We define `process.env.NODE_ENV = "production"` so React doesn't search for Node's `process` global.
-
-```bash
-esbuild src/entry.jsx --bundle --format=iife --platform=neutral --define:process.env.NODE_ENV='"production"' --outfile=dist/bundle.js
+### 1. Why `src/bundle.rs`?
+In `ssr-platform`, reading bundle files and concatenating shims is handled by **`src/bundle.rs`**:
+```rust
+pub fn build_script(bundle_path: &str) -> Option<String> {
+    let bundle = std::fs::read_to_string(bundle_path).ok()?;
+    Some(format!("{}\n{}", HOST_API_SHIM_PRELUDE, bundle))
+}
 ```
+This keeps file I/O and script assembly separated from V8 execution.
 
-### 2. Why `src/shims.rs`?
-React's browser build expects certain Web APIs (`queueMicrotask`, `setTimeout`, `TextEncoder`, `TextDecoder`, `MessageChannel`). 
-
-Following the architecture of `ssr-platform`, we isolate all runtime polyfills in **`src/shims.rs`**. We evaluate this prelude in V8 **before** running the React bundle so React finds all necessary globals on `globalThis`.
-
-### 3. The Global Render Contract
-The React bundle exposes a function on `globalThis`:
-```javascript
-globalThis.render = function(propsJson) {
-    const props = JSON.parse(propsJson);
-    return ReactDOMServer.renderToString(React.createElement(App, props));
-};
-```
+### 2. Standalone React Browser Build
+We import from `react-dom/server.browser` and use `esbuild --platform=neutral --define:process.env.NODE_ENV='"production"'` so React does not look for Node.js built-ins (`util`, `crypto`, `stream`).
 
 ---
 
 ## 📝 Implementation
 
-### 1. React Web Bundle Setup
-In `aegis-ssr/web/`:
+### 1. Set Up `web-bundle/`
+In the project root, create `web-bundle/`:
 ```bash
-mkdir -p web/src web/dist
+mkdir -p web-bundle/src web-bundle/dist
 ```
 
-`web/package.json`:
+`web-bundle/package.json`:
 ```json
 {
-  "name": "aegis-web",
+  "name": "aegis-web-bundle",
   "version": "1.0.0",
   "scripts": {
     "build": "esbuild src/entry.jsx --bundle --format=iife --platform=neutral --define:process.env.NODE_ENV='\"production\"' --outfile=dist/bundle.js"
@@ -59,7 +71,7 @@ mkdir -p web/src web/dist
 }
 ```
 
-`web/src/entry.jsx`:
+`web-bundle/src/entry.jsx`:
 ```jsx
 import React from 'react';
 import ReactDOMServer from 'react-dom/server.browser';
@@ -74,22 +86,22 @@ function App({ title, user }) {
   );
 }
 
-// Register global render function
+// Expose global render function
 globalThis.render = function(propsJson) {
   const props = JSON.parse(propsJson);
   return ReactDOMServer.renderToString(React.createElement(App, props));
 };
 ```
 
-Build the bundle:
+Compile the bundle:
 ```bash
-cd web && npm install && npm run build && cd ..
+cd web-bundle && npm install && npm run build && cd ..
 ```
 
 ---
 
-### 2. Browser Shims Module (`src/shims.rs`)
-Create `src/shims.rs` to hold the Web API polyfills:
+### 2. Complete `src/shims.rs`
+Update `src/shims.rs` with the complete browser prelude from `ssr-platform`:
 
 ```rust
 pub const HOST_API_SHIM_PRELUDE: &str = r#"
@@ -147,55 +159,95 @@ if (typeof MessageChannel === "undefined") {
 
 ---
 
-### 3. Rust Host Execution (`src/main.rs`)
+### 3. Create `src/bundle.rs`
+Create `src/bundle.rs` matching `ssr-platform/src/bundle.rs`:
+
 ```rust
-mod shims;
-
+use crate::shims::HOST_API_SHIM_PRELUDE;
 use std::fs;
-use shims::HOST_API_SHIM_PRELUDE;
 
-fn main() {
-    // 1. Initialize V8
-    let platform = v8::new_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
+/// Reads compiled bundle from disk and prepends host API shims
+pub fn build_script(bundle_path: &str) -> Option<String> {
+    let bundle = fs::read_to_string(bundle_path).ok()?;
+    Some(format!("{}\n{}", HOST_API_SHIM_PRELUDE, bundle))
+}
+```
 
-    // 2. Read the bundled JavaScript file
-    let bundle_source = fs::read_to_string("web/dist/bundle.js")
-        .expect("Please build bundle first: (cd web && npm run build)");
+---
 
+### 4. Update `src/lib.rs`
+`src/lib.rs` only exports the modules:
+
+```rust
+pub mod bundle;
+pub mod isolate_runner;
+pub mod shims;
+```
+
+---
+
+### 5. Update `src/isolate_runner.rs`
+Add `render_bundle` to call `globalThis.render`:
+
+```rust
+pub fn render_bundle(assembled_script: &str, props_json: &str) -> Result<String, String> {
     let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
     v8::scope!(let scope, isolate);
 
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
-    // 3. Evaluate the shims prelude FIRST so React finds Web APIs
-    let shim_code = v8::String::new(scope, HOST_API_SHIM_PRELUDE).unwrap();
-    let shim_script = v8::Script::compile(scope, shim_code, None).unwrap();
-    shim_script.run(scope).expect("Shims prelude evaluation failed");
+    // 1. Compile and evaluate shims + bundle
+    let code = match v8::String::new(scope, assembled_script) {
+        Some(c) => c,
+        None => return Err("Failed to allocate bundle string".to_string()),
+    };
 
-    // 4. Compile and execute the React bundle
-    let code = v8::String::new(scope, &bundle_source).unwrap();
-    let script = v8::Script::compile(scope, code, None).unwrap();
-    script.run(scope).expect("Bundle evaluation failed");
+    let script = match v8::Script::compile(scope, code, None) {
+        Some(s) => s,
+        None => return Err("Failed to compile bundle".to_string()),
+    };
 
-    // 5. Retrieve `globalThis.render`
+    if script.run(scope).is_none() {
+        return Err("Bundle initialization failed".to_string());
+    }
+
+    // 2. Fetch globalThis.render
     let global = context.global(scope);
     let render_key = v8::String::new(scope, "render").unwrap();
     let render_val = global.get(scope, render_key.into()).unwrap();
-    let render_fn: v8::Local<v8::Function> = render_val.try_into().unwrap();
+    let render_fn: v8::Local<v8::Function> = match render_val.try_into() {
+        Ok(f) => f,
+        Err(_) => return Err("globalThis.render is not a function".to_string()),
+    };
 
-    // 6. Call `render(propsJson)`
+    // 3. Call render(propsJson)
+    let props_str = v8::String::new(scope, props_json).unwrap();
+    match render_fn.call(scope, global.into(), &[props_str.into()]) {
+        Some(val) => Ok(val.to_rust_string_lossy(scope)),
+        None => Err("render() invocation failed".to_string()),
+    }
+}
+```
+
+---
+
+### 6. Update `src/main.rs`
+```rust
+use aegis_ssr::{bundle::build_script, isolate_runner::{init_v8_once, render_bundle}};
+
+fn main() {
+    init_v8_once();
+
+    let assembled_script = build_script("web-bundle/dist/bundle.js")
+        .expect("Please build bundle: (cd web-bundle && npm run build)");
+
     let props = r#"{"title": "Aegis Storefront", "user": "Engineer"}"#;
-    let props_str = v8::String::new(scope, props).unwrap();
 
-    let html_val = render_fn.call(scope, global.into(), &[props_str.into()])
-        .expect("render() call failed");
-
-    let html = html_val.to_rust_string_lossy(scope);
-
-    println!("🎨 Server-Side Rendered HTML:\n\n{}", html);
+    match render_bundle(&assembled_script, props) {
+        Ok(html) => println!("🎨 Server-Side Rendered HTML:\n\n{}", html),
+        Err(err) => eprintln!("❌ Render error: {}", err),
+    }
 }
 ```
 
@@ -217,6 +269,6 @@ Expected output:
 ---
 
 ## ✅ Checklist
-- [ ] Understand why `src/shims.rs` isolates browser polyfills from core logic.
-- [ ] Successfully load and evaluate `HOST_API_SHIM_PRELUDE` before bundle execution.
-- [ ] Pass dynamic JSON props from Rust into JavaScript and receive full React-rendered HTML.
+- [ ] Created `web-bundle/` matching `ssr-platform/web-bundle`.
+- [ ] Created `src/bundle.rs` to assemble shims and compiled code.
+- [ ] Executed `render_bundle` in `src/isolate_runner.rs` and received valid HTML.
